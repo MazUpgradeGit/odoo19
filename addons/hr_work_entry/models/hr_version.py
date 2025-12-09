@@ -18,10 +18,10 @@ class HrVersion(models.Model):
     _inherit = 'hr.version'
 
     date_generated_from = fields.Datetime(string='Generated From', readonly=True, required=True,
-        default=lambda self: datetime.now().replace(hour=0, minute=0, second=0, microsecond=0), copy=False,
+        default=lambda self: datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
         groups="hr.group_hr_user", tracking=True)
     date_generated_to = fields.Datetime(string='Generated To', readonly=True, required=True,
-        default=lambda self: datetime.now().replace(hour=0, minute=0, second=0, microsecond=0), copy=False,
+        default=lambda self: datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
         groups="hr.group_hr_user", tracking=True)
     last_generation_date = fields.Date(string='Last Generation Date', readonly=True, groups="hr.group_hr_user", tracking=True)
     work_entry_source = fields.Selection([('calendar', 'Working Schedule')], required=True, default='calendar', tracking=True, help='''
@@ -175,7 +175,7 @@ class HrVersion(models.Model):
         version_vals = []
         bypassing_work_entry_type_codes = self._get_bypassing_work_entry_type_codes()
 
-        attendances_by_resource = self._get_attendance_intervals(start_dt, end_dt)
+        attendances_by_resource = self.sudo()._get_attendance_intervals(start_dt, end_dt)
 
         resource_calendar_leaves = self._get_resource_calendar_leaves(start_dt, end_dt)
         # {resource: resource_calendar_leaves}
@@ -318,6 +318,9 @@ class HrVersion(models.Model):
                 for leave_interval in [(l[0], l[1], interval[2]) for l in leaves_over_interval]:
                     leave_entry_type = version._get_interval_leave_work_entry_type(leave_interval, leaves, bypassing_work_entry_type_codes)
                     interval_leaves = [leave for leave in leaves if leave[2].work_entry_type_id.id == leave_entry_type.id]
+                    if not interval_leaves:
+                        # Maybe the computed leave type is not found. In that case, we use all leaves
+                        interval_leaves = leaves
                     interval_start = leave_interval[0].astimezone(pytz.utc).replace(tzinfo=None)
                     interval_stop = leave_interval[1].astimezone(pytz.utc).replace(tzinfo=None)
                     version_vals += [dict([
@@ -424,39 +427,52 @@ class HrVersion(models.Model):
             'date_generated_from': date_start,
             'date_generated_to': date_start,
         })
-        utc = pytz.timezone('UTC')
-        for version in self:
-            version_tz = (version.resource_calendar_id or version.company_id.resource_calendar_id or version.employee_id).tz
-            tz = pytz.timezone(version_tz) if version_tz else pytz.utc
-            version_start = tz.localize(fields.Datetime.to_datetime(version.date_start)).astimezone(utc).replace(tzinfo=None)
-            version_stop = datetime.combine(fields.Datetime.to_datetime(version.date_end or datetime.max.date()),
-                                             datetime.max.time())
-            if version.date_end:
-                version_stop = tz.localize(version_stop).astimezone(utc).replace(tzinfo=None)
-            if date_start > version_stop or date_stop < version_start:
-                continue
-            date_start_work_entries = max(date_start, version_start)
-            date_stop_work_entries = min(date_stop, version_stop)
-            if force:
-                intervals_to_generate[date_start_work_entries, date_stop_work_entries] |= version
-                continue
+        domain_to_nullify = Domain(False)
+        work_entry_null_vals = {field: False for field in self.env["hr.work.entry.regeneration.wizard"]._work_entry_fields_to_nullify()}
 
-            # For each version, we found each interval we must generate
-            # In some cases we do not want to set the generated dates beforehand, since attendance based work entries
-            #  is more dynamic, we want to update the dates within the _get_work_entries_values function
-            last_generated_from = min(version.date_generated_from, version_stop)
-            if last_generated_from > date_start_work_entries:
-                version.date_generated_from = date_start_work_entries
-                intervals_to_generate[date_start_work_entries, last_generated_from] |= version
+        for tz, versions in self.grouped("tz").items():
+            tz = pytz.timezone(tz) if tz else pytz.utc
+            for version in versions:
+                version_start = tz.localize(fields.Datetime.to_datetime(version.date_start)).astimezone(pytz.utc).replace(tzinfo=None)
+                version_stop = tz.localize(datetime.combine(fields.Datetime.to_datetime(version.date_end or date_stop),
+                                                 datetime.max.time())).astimezone(pytz.utc).replace(tzinfo=None)
+                if version_stop < date_start:
+                    continue
+                if version_stop < date_stop:
+                    if version.date_generated_from != version.date_generated_to:
+                        domain_to_nullify |= Domain([
+                            ('version_id', '=', version.id),
+                            ('date', '>', version_stop),
+                            ('date', '<=', date_stop),
+                            ('state', '!=', 'validated'),
+                        ])
+                if date_start > version_stop or date_stop < version_start:
+                    continue
+                date_start_work_entries = max(date_start, version_start)
+                date_stop_work_entries = min(date_stop, version_stop)
+                if force:
+                    intervals_to_generate[date_start_work_entries, date_stop_work_entries] |= version
+                    continue
 
-            last_generated_to = max(version.date_generated_to, version_start)
-            if last_generated_to < date_stop_work_entries:
-                version.date_generated_to = date_stop_work_entries
-                intervals_to_generate[last_generated_to, date_stop_work_entries] |= version
+                # For each version, we found each interval we must generate
+                # In some cases we do not want to set the generated dates beforehand, since attendance based work entries
+                #  is more dynamic, we want to update the dates within the _get_work_entries_values function
+                last_generated_from = min(version.date_generated_from, version_stop)
+                if last_generated_from > date_start_work_entries:
+                    version.date_generated_from = date_start_work_entries
+                    intervals_to_generate[date_start_work_entries, last_generated_from] |= version
+
+                last_generated_to = max(version.date_generated_to, version_start)
+                if last_generated_to < date_stop_work_entries:
+                    version.date_generated_to = date_stop_work_entries
+                    intervals_to_generate[last_generated_to, date_stop_work_entries] |= version
 
         for interval, versions in intervals_to_generate.items():
             date_from, date_to = interval
             vals_list.extend(versions._get_work_entries_values(date_from, date_to))
+
+        work_entries_to_nullify = self.env['hr.work.entry'].search(domain_to_nullify)
+        work_entries_to_nullify.write(work_entry_null_vals)
 
         if not vals_list:
             return self.env['hr.work.entry']
@@ -630,11 +646,12 @@ class HrVersion(models.Model):
 
     def write(self, vals):
         result = super().write(vals)
+        if self.env.context.get('salary_simulation'):
+            return result
         if vals.get('contract_date_end') or vals.get('contract_date_start') or vals.get('date_version'):
             self.sudo()._remove_work_entries()
         dependent_fields = self._get_fields_that_recompute_we()
-        salary_simulation = self.env.context.get('salary_simulation')
-        if not salary_simulation and any(key in dependent_fields for key in vals):
+        if any(key in dependent_fields for key in vals):
             for version_sudo in self.sudo():
                 date_from = max(version_sudo.date_start, version_sudo.date_generated_from.date())
                 date_to = min(version_sudo.date_end or date.max, version_sudo.date_generated_to.date())

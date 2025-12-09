@@ -100,6 +100,7 @@ test("getTotalDiscount", async () => {
     const line2 = order.lines[1];
     line1.setDiscount(20);
     line2.setDiscount(50);
+
     expect(order.getTotalDiscount()).toBe(5.82);
     const taxTotalsWDiscount = order.prices.taxDetails;
     expect(taxTotalsWDiscount.base_amount).toBe(10.2);
@@ -269,4 +270,28 @@ test("[get prices] check prices and taxes", async () => {
     expect(line1DataWDiscount.no_discount_total_excluded).toBe(9.0);
     expect(line1DataWDiscount.no_discount_total_included).toBe(10.35);
     expect(line1DataWDiscount.no_discount_taxes_data[0].tax_amount).toBe(1.35);
+});
+
+test("showChange remains true when change line name is translated", async () => {
+    const store = await setupPosEnv();
+    const order = await getFilledOrder(store);
+    const cashPaymentMethod = store.models["pos.payment.method"].get(1);
+
+    const { data: paymentLine } = order.addPaymentline(cashPaymentMethod);
+    const overpaidAmount = order.totalDue + 5;
+    paymentLine.setAmount(overpaidAmount);
+
+    const changeAmount = paymentLine.getAmount() - order.totalDue;
+    const changeLine = order.models["pos.payment"].create({
+        pos_order_id: order,
+        payment_method_id: cashPaymentMethod,
+    });
+    changeLine.setAmount(-changeAmount);
+    changeLine.name = "Retour"; // Simulate translated "return"
+    changeLine.is_change = true;
+
+    order.state = "paid";
+
+    expect(order.change).toBe(-changeAmount);
+    expect(order.showChange).toBe(true);
 });
